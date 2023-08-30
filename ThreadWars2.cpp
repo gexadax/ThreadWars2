@@ -6,7 +6,7 @@
 #include <string>
 #include <thread>
 #include <list>
-#include <condition_variable>
+#include <future>
 
 using namespace std;
 
@@ -31,7 +31,7 @@ void locked_output(const std::string &str) {
 	cout << str << endl;
 }
 
-void thraedAwork(Part::PartPtr &part) {
+void threadAwork(Part::PartPtr &part) {
 	srand(7777777);
 	part->volume -= 2;
 
@@ -55,35 +55,41 @@ void threadCwork(Part::PartPtr& part) {
 	locked_output("threadCwork finished with part " + to_string(part->part_id));
 }
 
-void threadA(list<Part::PartPtr>& input) {
-	size_t size = input.size();
-	for (size_t i = 0; i < size; i++) {
-		thraedAwork(*input.begin());
-		{
-			lock_guard<mutex> raii(lock_queue);
-			shared_queue.push(Part::PartPtr(*input.begin()));
-			input.remove(*input.begin());
-			locked_output("Part was added it queue");
-			event_holder.notify_one();
-		}
-	}
-	done = true;
-	event_holder.notify_one();
+void threadA(list<Part::PartPtr>& input, promise<void>& a_p) {
+    srand(77777777);
+    size_t size = input.size();
+    for (size_t i = 0; i < size; i++) {
+        threadAwork(*input.begin());
+        {
+            lock_guard<mutex> raii_obj(lock_queue);
+            shared_queue.push(Part::PartPtr(*input.begin()));
+            input.remove(*input.begin());
+            locked_output("Part was added to queue");
+            event_holder.notify_one();
+        }
+    }
+    a_p.set_value();
+    event_holder.notify_one();
 }
 
-void threadB() {
+void threadB(promise<void>& a_p, promise<void>& b_p) {
     srand(1000000);
+    auto f = a_p.get_future();
     while (true) {
         list<Part::PartPtr> parts_for_work;
         {
             unique_lock<mutex> m_holder(lock_queue);
 
-            if (done && shared_queue.empty()) {
+            if (f.wait_for(chrono::seconds(0)) == future_status::ready
+                && shared_queue.empty()) {
                 break;
             }
 
             if (shared_queue.empty()) {
-                event_holder.wait(m_holder, []() { return !shared_queue.empty() || done; });
+                event_holder.wait(m_holder, [&f]() {
+                    return !shared_queue.empty() ||
+                        f.wait_for(chrono::seconds(0)) == future_status::ready;
+                    });
             }
             for (size_t i = 0; i < shared_queue.size(); i++)
             {
@@ -100,22 +106,26 @@ void threadB() {
             event_holder2.notify_one();
         }
     }
-    done2 = true;
+    b_p.set_value();
     event_holder2.notify_one();
 }
 
-
-void threadC() {
+void threadC(promise<void>& b_p, promise<void>& c_p) {
     srand(5555555);
+    auto f = b_p.get_future();
     while (true) {
         list<Part::PartPtr> parts_for_work;
         {
             unique_lock<mutex> m_holder(lock_queue2);
 
-            if (done2 && shared_queue2.empty()) break;
+            if (f.wait_for(chrono::seconds(0)) == future_status::ready
+                && shared_queue2.empty()) break;
 
             if (shared_queue2.empty()) {
-                event_holder2.wait(m_holder, []() { return !shared_queue2.empty() || done2; });
+                event_holder2.wait(m_holder, [&f]() {
+                    return !shared_queue2.empty() ||
+                        f.wait_for(chrono::seconds(0)) == future_status::ready;
+                    });
             }
             for (size_t i = 0; i < shared_queue2.size(); i++)
             {
@@ -126,8 +136,8 @@ void threadC() {
         for (auto& p : parts_for_work)
             threadCwork(p);
     }
+    c_p.set_value();
 }
-
 
 int main(int argc, char* argv[])
 {
@@ -137,14 +147,20 @@ int main(int argc, char* argv[])
         spare_parts.push_back(Part::PartPtr(new Part{ i + 1, 10.0 }));
     }
 
-    thread ta(threadA, ref(spare_parts));
-    thread tb(threadB);
-    thread tc(threadC);
+    promise<void> a_p;
+    thread ta(threadA, std::ref(spare_parts), std::ref(a_p));
+    promise<void> b_p;
+    thread tb(threadB, std::ref(a_p), std::ref(b_p));
+    promise<void> c_p;
+    auto f = c_p.get_future();
+    thread tc(threadC, std::ref(b_p), std::ref(c_p));
 
-    ta.join();
-    tb.join();
-    tc.join();
+    ta.detach();
+    tb.detach();
+    tc.detach();
 
-    locked_output("done");
+    f.wait();
+
+    cout << "done";
     return 0;
 }
